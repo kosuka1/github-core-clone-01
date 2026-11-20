@@ -95,9 +95,12 @@ async function handle(forge: Forge, req: IncomingMessage, res: ServerResponse): 
 
   // ---------------------------------------------------------- REST v3
   if (path === '/api/v3' || path.startsWith('/api/v3/')) {
-    const body = await readBody(req);
+    // GET and HEAD carry no body the handlers read; waiting for the request
+    // stream to end would cost an event-loop turn on every single read.
+    const mayHaveBody = method === 'POST' || method === 'PUT' || method === 'PATCH' || method === 'DELETE';
+    const body = mayHaveBody ? await readBody(req) : Buffer.alloc(0);
     let parsed: Record<string, unknown> | undefined;
-    if (body.length > 0 && (method === 'POST' || method === 'PUT' || method === 'PATCH' || method === 'DELETE')) {
+    if (body.length > 0 && mayHaveBody) {
       try {
         const value = JSON.parse(body.toString('utf8')) as unknown;
         parsed = value !== null && typeof value === 'object' ? (value as Record<string, unknown>) : {};

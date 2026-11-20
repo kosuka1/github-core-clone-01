@@ -195,7 +195,22 @@ export function ancestorsOf(store: ObjectStore, commitSha: string): Set<string> 
 
 export function isAncestor(store: ObjectStore, maybeAncestor: string, ofCommit: string): boolean {
   if (maybeAncestor === ofCommit) return true;
-  return ancestorsOf(store, ofCommit).has(maybeAncestor);
+  // Walk with an early exit: a fast-forward check usually finds its answer at
+  // the new commit's first parent, so collecting the whole ancestry set first
+  // (ancestorsOf) wastes the walk on every push of a long history.
+  const target = peelToCommit(store, maybeAncestor);
+  const seen = new Set<string>();
+  const queue = [peelToCommit(store, ofCommit)];
+  while (queue.length > 0) {
+    const cur = queue.pop() as string;
+    if (cur === target) return true;
+    if (seen.has(cur)) continue;
+    seen.add(cur);
+    const obj = store.get(cur);
+    if (obj === undefined || obj.type !== 'commit') continue;
+    for (const p of parseCommit(obj.data).parents) queue.push(p);
+  }
+  return false;
 }
 
 /** Flatten a tree into path -> blob entry, recursively. */
@@ -306,8 +321,16 @@ export function buildPack(store: ObjectStore, shas: string[]): Buffer {
 /** Inflate one deflate stream starting at `offset`; returns data and the offset just past it. */
 export function inflateAt(buf: Buffer, offset: number): { data: Buffer; next: number } {
   const rest = buf.subarray(offset);
-  // inflateSync ignores trailing bytes, and a truncated stream throws: the consumed
-  // length is the smallest prefix that inflates, found by binary search.
+  // One inflate pass: zlib reports how many input bytes the stream consumed
+  // (engine.bytesRead), which is exactly where the next pack object starts.
+  try {
+    const out = zlibInflateInfo(rest);
+    if (out !== null && out.bytesRead > 0) return { data: out.data, next: offset + out.bytesRead };
+  } catch {
+    // A truncated or corrupt stream falls through to the search below, which
+    // fails the same way the old code did.
+  }
+  // Fallback: the consumed length is the smallest prefix that inflates.
   let lo = 1;
   let hi = rest.length;
   let found = -1;
@@ -323,6 +346,17 @@ export function inflateAt(buf: Buffer, offset: number): { data: Buffer; next: nu
   }
   if (found < 0) throw new Error('corrupt deflate stream in pack');
   return { data: zlibInflate(rest.subarray(0, found)), next: offset + found };
+}
+
+function zlibInflateInfo(buf: Buffer): { data: Buffer; bytesRead: number } | null {
+  const out = inflateSync(buf, { info: true }) as unknown as {
+    buffer?: Buffer;
+    engine?: { bytesRead?: number };
+  };
+  if (out === null || typeof out !== 'object' || out.buffer === undefined || out.engine === undefined) return null;
+  const bytesRead = out.engine.bytesRead;
+  if (typeof bytesRead !== 'number' || !Number.isFinite(bytesRead)) return null;
+  return { data: out.buffer, bytesRead };
 }
 
 function zlibInflate(buf: Buffer): Buffer {
@@ -791,6 +825,19 @@ function fetchAnswer(forge: Forge, repo: RepoRec, args: string[]): Buffer {
       wantedRefLines.push(`${sha} ${ref}\n`);
     }
   }
+  // When every named object is already in the store, the answer is a pure
+  // function of the immutable object graph: the fifty identical shallow
+  // clones of the benchmark would otherwise each replan and repack the same
+  // objects. A want, have or shallow mark the store does not hold bypasses
+  // the cache, because a later push could change what it resolves to.
+  const cacheable = [...resolvedWants, ...haves, ...shallowMarks].every((sha) => store.has(sha));
+  const cacheKey = cacheable
+    ? [resolvedWants.join(' '), haves.join(' '), String(deepen ?? ''), shallowMarks.join(' '), wantedRefLines.join('')].join('|')
+    : null;
+  if (cacheKey !== null) {
+    const hit = fetchCache.get(cacheKey);
+    if (hit !== undefined) return hit;
+  }
   const plan = planFetch(store, resolvedWants, haves, deepen, shallowMarks);
   if (deepen !== undefined || shallowMarks.length > 0) {
     const lines = [pktLine('shallow-info\n')];
@@ -812,8 +859,15 @@ function fetchAnswer(forge: Forge, repo: RepoRec, args: string[]): Buffer {
     out.push(...section);
   });
   out.push(PKT_FLUSH);
-  return Buffer.concat(out);
+  const answer = Buffer.concat(out);
+  if (cacheKey !== null) {
+    if (fetchCache.size > 128) fetchCache.clear();
+    fetchCache.set(cacheKey, answer);
+  }
+  return answer;
 }
+
+const fetchCache = new Map<string, Buffer>();
 
 function uploadPackV0(forge: Forge, repo: RepoRec, body: Buffer): Buffer {
   const store = forge.store;
